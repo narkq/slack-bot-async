@@ -35,6 +35,7 @@ module Web.Slack
 -- Re-exports
 , Slack(..)
 , SlackBot
+, liftIO
 , module Web.Slack.Types
 ) where
 
@@ -45,6 +46,7 @@ import           Control.Concurrent.STM.TQueue ( readTQueue
                                                )
 import           Control.Lens
 import           Control.Monad (forever, void, unless)
+import           Control.Monad.IO.Class (liftIO)
 import           Control.Monad.Reader       (runReaderT)
 import           Data.Aeson
 import           Data.Aeson.Lens
