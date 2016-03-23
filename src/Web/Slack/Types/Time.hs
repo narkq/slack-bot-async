@@ -5,7 +5,6 @@ import Data.Time.Clock.POSIX
 import Data.Aeson
 import Data.Aeson.Types
 import qualified Data.Text as T
-import Control.Applicative
 import Control.Error
 import Control.Lens.TH
 

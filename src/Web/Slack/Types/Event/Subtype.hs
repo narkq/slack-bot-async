@@ -9,7 +9,6 @@ import Web.Slack.Types.File hiding (URL)
 import Web.Slack.Types.Comment
 import Web.Slack.Types.Bot
 import Web.Slack.Types.Item
-import Control.Applicative
 import Data.Text (Text)
 import Control.Lens.TH
 

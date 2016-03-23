@@ -21,11 +21,7 @@ import Data.Aeson
 import Data.Aeson.Types
 
 import Control.Lens.TH
-import Control.Applicative
 import Data.Text (Text)
-import qualified Data.Text as T
-import Data.Monoid
-import Prelude
 
 type Domain = Text
 
@@ -124,9 +120,9 @@ parseType o@(Object v) typ =
                   Nothing -> return Nothing
                   Just r  -> Just <$> subtype r o) =<< v .:? "subtype"
         submitter <- case subt of
-                      Just (SBotMessage bid _ _) -> return $ BotComment bid
-                      _ -> maybe System UserComment <$> v .:? "user"
-        (v .: "channel") :: Parser ChannelId
+                       Just (SBotMessage bid _ _) -> return $ BotComment bid
+                       _ -> maybe System UserComment <$> v .:? "user"
+        _ <- (v .: "channel") :: Parser ChannelId
         hidden <- (\case {Just True -> True; _ -> False}) <$> v .:? "hidden"
         if not hidden
           then Message <$>  v .: "channel" <*> pure submitter  <*> v .: "text" <*> v .: "ts" <*> pure subt <*> v .:? "edited"
@@ -198,12 +194,17 @@ data Submitter = UserComment UserId | BotComment BotId | System deriving (Show, 
 data ChannelRenameInfo = ChannelRenameInfo
                        { _channelRenameId      :: ChannelId
                        , _channelRenameName    :: Text
-                       , _channelRenameCreated :: Time } deriving Show
+                       , _channelRenameCreated :: Time
+                       } deriving Show
 
 makeLenses ''ChannelRenameInfo
 
 instance FromJSON ChannelRenameInfo where
-  parseJSON = withObject "ChannelRenameInfo" (\o -> ChannelRenameInfo <$> o .: "id" <*> o .: "name" <*> o .: "created")
+  parseJSON = withObject "ChannelRenameInfo"
+                (\o -> ChannelRenameInfo
+                       <$> o .: "id"
+                       <*> o .: "name"
+                       <*> o .: "created")
 
 
 makePrisms ''Event
