@@ -1,25 +1,26 @@
-module EchoBot where
+{-# LANGUAGE OverloadedStrings #-}
+module Main where
+
+import Control.Monad.Logger ( runStdoutLoggingT
+                            , logInfoNS
+                            , filterLogger
+                            , LogLevel(LevelDebug)
+                            )
+import Data.Maybe (fromMaybe)
+import System.Environment (lookupEnv)
 
 import Web.Slack
-import Web.Slack.Message
-import System.Environment (lookupEnv)
-import Data.Maybe (fromMaybe)
-import Control.Applicative
 
-myConfig :: String -> SlackConfig
-myConfig apiToken = SlackConfig
-         { _slackApiToken = apiToken -- Specify your API token here
-         }
-
-echoBot :: SlackBot ()
-echoBot (Message cid _ msg _ _ _) = sendMessage cid msg
+echoBot :: SlackBot
+echoBot (Message cid _ msg _ _ _) = do
+  logInfoNS "echoBot" msg
+  sendMessage cid msg
 echoBot _ = return ()
 
 main :: IO ()
 main = do
-  apiToken <- fromMaybe (error "SLACK_API_TOKEN not set")
-               <$> lookupEnv "SLACK_API_TOKEN"
-  runBot (myConfig apiToken) echoBot ()
-
-
-
+  token <- fromMaybe (error "SLACK_API_TOKEN not set")
+           <$> lookupEnv "SLACK_API_TOKEN"
+  runStdoutLoggingT
+    $ filterLogger (\_ lvl -> lvl /= LevelDebug)
+    $ runBot (SlackConfig token) echoBot

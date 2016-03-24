@@ -1,39 +1,38 @@
-{-# LANGUAGE TemplateHaskell #-}
-module CounterBot where
+{-# LANGUAGE OverloadedStrings #-}
+module Main where
 
-import qualified Data.Text as T (pack)
+import           Control.Concurrent.STM (atomically)
+import           Control.Concurrent.STM.TVar ( TVar
+                                             , newTVarIO
+                                             , modifyTVar'
+                                             , readTVar
+                                             )
+import           Control.Monad.Logger ( runStdoutLoggingT
+                                      , logInfoNS
+                                      , filterLogger
+                                      , LogLevel(LevelDebug)
+                                      )
+import           Data.Maybe (fromMaybe)
+import qualified Data.Text as T
+import           System.Environment (lookupEnv)
 
-import Web.Slack
-import Web.Slack.Message
+import           Web.Slack
 
-import System.Environment (lookupEnv)
-import Data.Maybe (fromMaybe)
-import Control.Applicative
 
-import Control.Lens
-
-myConfig :: String -> SlackConfig
-myConfig apiToken = SlackConfig
-         { _slackApiToken = apiToken
-         }
-
-data CounterState = CounterState
-                  { _messageCount :: Int
-                  }
-
-makeLenses ''CounterState
-
--- Count how many messages the bot recieves
-counterBot :: SlackBot CounterState
-counterBot (Message cid _ _ _ _ _) = do
-  num <- userState . messageCount <%= (+1)
+-- Count how many messages the bot receives
+counterBot :: TVar Int -> SlackBot
+counterBot counter (Message cid _ _ _ _ _) = do
+  num <- liftIO $ atomically (do modifyTVar' counter (+ 1)
+                                 readTVar counter)
+  logInfoNS "counterBot" $ T.pack $ show num
   sendMessage cid (T.pack . show $ num)
-counterBot _ = return ()
+counterBot _ _ = return ()
 
 main :: IO ()
 main = do
-  apiToken <- fromMaybe (error "SLACK_API_TOKEN not set")
-               <$> lookupEnv "SLACK_API_TOKEN"
-  runBot (myConfig apiToken) counterBot startState
-  where
-    startState = CounterState 0
+  token <- fromMaybe (error "SLACK_API_TOKEN not set")
+           <$> lookupEnv "SLACK_API_TOKEN"
+  counter <- newTVarIO 0
+  runStdoutLoggingT
+    $ filterLogger (\_ lvl -> lvl /= LevelDebug)
+    $ runBot (SlackConfig token) (counterBot counter)

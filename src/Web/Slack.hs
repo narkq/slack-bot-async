@@ -15,6 +15,7 @@
 --
 -- This basic example echos every message the bot recieves.
 -- Other examples can be found in the
+-- FIXME
 -- @<http://google.com examples>@ directory.
 --
 -- > myConfig :: SlackConfig
@@ -36,10 +37,12 @@ module Web.Slack
 , Slack(..)
 , SlackBot
 , liftIO
+, ping
+, sendMessage
 , module Web.Slack.Types
 ) where
 
-import           Control.Concurrent (forkIO)
+import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.STM (atomically)
 import           Control.Concurrent.STM.TQueue ( readTQueue
                                                , newTQueueIO
@@ -47,11 +50,20 @@ import           Control.Concurrent.STM.TQueue ( readTQueue
 import           Control.Lens
 import           Control.Monad (forever, void, unless)
 import           Control.Monad.IO.Class (liftIO)
-import           Control.Monad.Reader       (runReaderT)
+import           Control.Monad.Reader (ask)
+import           Control.Monad.Logger ( LoggingT
+                                      , logDebugNS
+                                      , logInfoN
+                                      , askLoggerIO
+                                      , logErrorN
+                                      , logErrorNS
+                                      )
 import           Data.Aeson
 import           Data.Aeson.Lens
 import qualified Data.ByteString.Lazy       as B
 import qualified Data.ByteString.Lazy.Char8 as BC
+import           Data.Monoid ((<>))
+import qualified Data.Text                  as T
 import           Data.Text.Lens (unpacked)
 import qualified Network.Socket             as S
 import qualified Network.URI                as URI
@@ -61,23 +73,27 @@ import           Network.Wreq
 import qualified OpenSSL                    as SSL
 import qualified OpenSSL.Session            as SSL
 import qualified System.IO.Streams.Internal as StreamsIO
-import           System.IO.Streams.SSL      (sslToStreams)
+import           System.IO.Streams.SSL (sslToStreams)
 import           Data.Time.Clock.POSIX (getPOSIXTime)
 
+import           Web.Slack.Send (ping, sendMessage)
 import           Web.Slack.Types
 
 
-type SlackBot = Event -> Slack ()
-
+type SlackBot  = Event -> Slack ()
 type URLString = String
 
-ioUserError :: String -> IO a
-ioUserError = ioError . userError
 
-rtmStart :: SlackConfig -> IO (URLString, SlackSession)
+ioUserError :: String -> LoggingT IO a
+ioUserError s = do
+  logErrorN $ T.pack s
+  liftIO . ioError $ userError s
+
+
+rtmStart :: SlackConfig -> LoggingT IO (URLString, SlackSession)
 rtmStart conf = do
   let token = conf ^. slackApiToken
-  r <- get $ "https://slack.com/api/rtm.start?token=" ++ token
+  r <- liftIO . get $ "https://slack.com/api/rtm.start?token=" ++ token
   case (r ^? responseBody) of
     Nothing -> ioUserError $ "No response body: " ++ show r
     Just resp -> do
@@ -88,8 +104,9 @@ rtmStart conf = do
       case eitherDecode resp of
         Left e -> ioUserError e
         Right session -> do
-          putStrLn "rtm.start call successful"
+          logInfoN "Connected"
           return (wsUrl, session)
+
 
 -- | Setup an SSL connection. Must be run in SSL.withOpenSSL
 setupSSL :: String -> IO SSL.SSL
@@ -104,24 +121,34 @@ setupSSL host = do
   SSL.connect ssl
   return ssl
 
+
 -- | Run a `SlackBot`. The supplied bot will respond to all events sent by
 -- the Slack RTM API.
 --
 -- Be warned that this function will throw an `IOError` if the connection
 -- to the Slack API fails.
-runBot :: SlackConfig -> SlackBot -> IO ()
+runBot :: SlackConfig -> SlackBot -> LoggingT IO ()
 runBot conf bot = do
   (wsUrl, session) <- rtmStart conf
+  loggerIO <- askLoggerIO
+  queue <- liftIO newTQueueIO
   case parseWebSocketUrl wsUrl of
     Nothing -> error $ "Couldn't parse WebSockets URL: " ++ wsUrl
     Just (host, path) ->
-      SSL.withOpenSSL $ do
+      liftIO . SSL.withOpenSSL $ do
         (sslIn, sslOut) <- sslToStreams =<< setupSSL host
         (stream :: WS.Stream) <-
           WS.makeStream (StreamsIO.read sslIn)
                         (\b -> StreamsIO.write (B.toStrict <$> b) sslOut)
         WS.runClientWithStream stream host path WS.defaultConnectionOptions []
-          (runBotSession conf session bot)
+          (\conn -> let botSession = SlackBotSession
+                                     { _connection = conn
+                                     , _slackSession = session
+                                     , _logger = loggerIO
+                                     , _sendQueue = queue
+                                     , _config = conf
+                                     }
+                    in runBotSession botSession bot)
   where
     parseWebSocketUrl :: URLString -> Maybe (String, String)
     parseWebSocketUrl url = do
@@ -129,48 +156,59 @@ runBot conf bot = do
       name <- URI.uriRegName <$> URI.uriAuthority uri
       return (name, URI.uriPath uri)
 
-runBotSession :: SlackConfig -> SlackSession -> SlackBot -> WS.ClientApp ()
-runBotSession conf session bot conn = do
-  WS.forkPingThread conn 10
-  queue <- newTQueueIO
-  void . forkIO $ sender conn queue
-  let slackBotSession =
-        SlackBotSession { _sendQueue = queue
-                        , _slackSession = session
-                        , _config = conf
-                        , _connection = conn
-                        }
-  botLoop slackBotSession bot
 
-sender :: WS.Connection -> SlackSendQueue -> IO ()
-sender conn queue = loop 1
+runBotSession :: SlackBotSession -> SlackBot -> IO ()
+runBotSession session bot = do
+  liftIO $ WS.forkPingThread (session ^. connection) 10
+  void . liftIO . forkIO $ runSlackBot session sender
+  void . liftIO . forkIO $ runSlackBot session pinger
+  runSlackBot session $ receiver bot
+
+
+pinger :: Slack ()
+pinger = void . forever $ do
+  liftIO $ threadDelay 1000000 -- 1 second
+  ping
+
+
+-- | Dedicated thread for sending pings and messages to Slack.
+-- This thread tracks the required, unique IDs for each message.
+sender :: Slack ()
+sender = loop 1
  where
+  loop :: Int -> Slack ()
   loop msgId = do
-    msg <- atomically $ readTQueue queue
+    session <- ask
+    msg <- liftIO . atomically $ readTQueue (session ^. sendQueue)
     payload <- case msg of
       SendPing -> encode <$> do
-        now <- round <$> getPOSIXTime
+        now <- round <$> (liftIO getPOSIXTime)
         return $ PingPayload msgId "ping" now
       SendMessage cid txt ->
         return . encode $ MessagePayload msgId "message" cid txt
-    WS.sendTextData conn payload
+    logDebugNS "sender" $ "Sending: " <> T.pack (BC.unpack payload)
+    liftIO $ WS.sendTextData (session ^. connection) payload
     loop $ msgId + 1
 
-botLoop :: SlackBotSession -> SlackBot -> IO ()
-botLoop slackBotSession bot = void . forever $ do
-  raw <- WS.receiveData $ slackBotSession ^. connection
+
+receiver :: SlackBot -> Slack ()
+receiver bot = void . forever $ do
+  session <- ask
+  raw <- liftIO . WS.receiveData $ session ^. connection
+  let rawText = T.pack (BC.unpack raw)
+  logDebugNS "receiver" $ "Received: " <> rawText
   case eitherDecode raw of
-    Left err -> do
-      BC.putStrLn raw
-      putStrLn err
-      putStrLn "Please report this failure to the github issue tracker"
+    Left decodeErr -> do
+      err $ "Failed to decode message: " <> rawText
+      err $ T.pack decodeErr
+      err "Please report this failure to the github issue tracker"
     Right event@(UnknownEvent e) -> do
-      print e
-      putStrLn "Failed to parse to a known event"
-      putStrLn "Please report this failure to the github issue tracker"
+      err $ "Failed to parse to a known event: " <> T.pack (show e)
+      err "Please report this failure to the github issue tracker"
       -- Still handle the event if a user wants to
-      go event
-    Right event -> go event
+      go session event
+    Right event -> go session event
  where
-  go :: Event -> IO ()
-  go event = void . forkIO $ runReaderT (runSlack $ bot event) slackBotSession
+  err = logErrorNS "receiver"
+  go :: SlackBotSession -> Event -> Slack ()
+  go session event = void . liftIO . forkIO . runSlackBot session $ bot event

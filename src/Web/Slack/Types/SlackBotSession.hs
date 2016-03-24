@@ -2,6 +2,7 @@
 module Web.Slack.Types.SlackBotSession where
 
 import Control.Lens (makeLenses)
+import Control.Monad.Logger (Loc, LogSource, LogLevel, LogStr)
 import qualified Network.WebSockets         as WS
 
 import Web.Slack.Types.Session (SlackSession)
@@ -14,6 +15,7 @@ data SlackBotSession = SlackBotSession
                                   -- start of the connection
   , _config       :: SlackConfig  -- ^ A copy of the initial configuration
   , _connection   :: WS.Connection
+  , _logger       :: Loc -> LogSource -> LogLevel -> LogStr -> IO ()
   }
 
 
