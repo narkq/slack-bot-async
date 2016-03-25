@@ -16,7 +16,7 @@ import           Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 import           System.Environment (lookupEnv)
 
-import           Web.Slack
+import           Slack.Bot
 
 
 -- Count how many messages the bot receives
@@ -35,4 +35,4 @@ main = do
   counter <- newTVarIO 0
   runStdoutLoggingT
     $ filterLogger (\_ lvl -> lvl /= LevelDebug)
-    $ runBot (SlackConfig token) (counterBot counter)
+    $ runBot token (counterBot counter)

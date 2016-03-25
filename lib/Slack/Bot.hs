@@ -1,27 +1,12 @@
-{-# LANGUAGE DataKinds                  #-}
-{-# LANGUAGE GADTs                      #-}
-{-# LANGUAGE LambdaCase                 #-}
-{-# LANGUAGE NoMonomorphismRestriction  #-}
-{-# LANGUAGE OverloadedStrings          #-}
-
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeFamilies               #-}
-{-# LANGUAGE TypeSynonymInstances       #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 ------------------------------------------
 -- |
--- This module exposes functionality to write bots which responds
--- to `Event`s sent by the RTM API. By using the user state parameter `s`
--- complicated interactions can be established.
---
--- This basic example echos every message the bot recieves.
--- Other examples can be found in the
--- FIXME
--- @<http://google.com examples>@ directory.
---
--- > myConfig :: SlackConfig
--- > myConfig = SlackConfig
--- >         { _slackApiToken = "..." -- Specify your API token here
--- >         }
+-- Example:
+-- > import Slack.Bot
+-- > import Control.Monad.Logger (runStdoutLoggingT)
 -- >
 -- > -- type SlackBot = Event -> Slack ()
 -- > echoBot :: SlackBot
@@ -29,59 +14,128 @@
 -- > echoBot _ = return ()
 -- >
 -- > main :: IO ()
--- > main = runBot myConfig echoBot ()
+-- > main = runStdoutLoggingT $ runBot "{- slack token goes here -}" echoBot
 --
-module Web.Slack
+module Slack.Bot
 ( runBot
--- Re-exports
 , Slack(..)
 , SlackBot
-, liftIO
+, Token
+, BotSession(..)
+, apiToken
+, slackSession
+, connection
+, sendQueue
+, logger
 , ping
 , sendMessage
-, module Web.Slack.Types
+
+-- Re-exports
+, liftIO
+, module Slack.API
 ) where
 
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.STM (atomically)
-import           Control.Concurrent.STM.TQueue ( readTQueue
+import           Control.Concurrent.STM.TQueue ( TQueue
                                                , newTQueueIO
+                                               , readTQueue
+                                               , writeTQueue
                                                )
 import           Control.Lens
 import           Control.Monad (forever, void, unless)
-import           Control.Monad.IO.Class (liftIO)
-import           Control.Monad.Reader (ask)
+import           Control.Monad.IO.Class (liftIO, MonadIO)
+import           Control.Monad.Reader ( MonadReader
+                                      , ReaderT
+                                      , runReaderT
+                                      , ask
+                                      , asks
+                                      )
 import           Control.Monad.Logger ( LoggingT
+                                      , MonadLogger
+                                      , runLoggingT
                                       , logDebugNS
                                       , logInfoN
                                       , askLoggerIO
                                       , logErrorN
                                       , logErrorNS
+                                      , Loc
+                                      , LogStr
+                                      , LogLevel
+                                      , LogSource
                                       )
-import           Data.Aeson
-import           Data.Aeson.Lens
+import           Data.Aeson (encode, eitherDecode)
+import           Data.Aeson.Lens (key, _String, _Primitive, Primitive(BoolPrim))
 import qualified Data.ByteString.Lazy       as B
 import qualified Data.ByteString.Lazy.Char8 as BC
 import           Data.Monoid ((<>))
+import           Data.Text                  (Text)
 import qualified Data.Text                  as T
 import           Data.Text.Lens (unpacked)
 import qualified Network.Socket             as S
 import qualified Network.URI                as URI
 import qualified Network.WebSockets         as WS
 import qualified Network.WebSockets.Stream  as WS
-import           Network.Wreq
+import           Network.Wreq (get, responseBody)
 import qualified OpenSSL                    as SSL
 import qualified OpenSSL.Session            as SSL
 import qualified System.IO.Streams.Internal as StreamsIO
 import           System.IO.Streams.SSL (sslToStreams)
 import           Data.Time.Clock.POSIX (getPOSIXTime)
 
-import           Web.Slack.Send (ping, sendMessage)
-import           Web.Slack.Types
+import           Slack.API
 
 
 type SlackBot  = Event -> Slack ()
+
 type URLString = String
+type Token = String
+
+
+newtype Slack a = Slack {unSlack :: ReaderT BotSession (LoggingT IO) a}
+  deriving ( Monad, Functor, Applicative, MonadIO
+           , MonadReader BotSession
+           , MonadLogger
+           )
+
+data SendPayload = SendPing
+                 | SendMessage ChannelId Text
+
+type SlackSendQueue = TQueue SendPayload
+
+data BotSession = BotSession
+  { _sendQueue    :: SlackSendQueue
+  , _apiToken     :: Token        -- ^ Slack API Token
+  , _slackSession :: SlackSession -- ^ Session information from the
+                                  -- start of the connection
+  , _connection   :: WS.Connection
+  , _logger       :: Loc -> LogSource -> LogLevel -> LogStr -> IO ()
+  }
+
+makeLenses ''BotSession
+
+runSlackBot :: BotSession -> Slack () -> IO ()
+runSlackBot session = (`runLoggingT` (session ^. logger))
+                    . (`runReaderT` session)
+                    . unSlack
+
+
+-- | Send a message to the specified channel.
+--
+-- If the message is longer than 4000 bytes then the connection will be
+-- closed.
+sendMessage :: ChannelId -> Text -> Slack ()
+sendMessage cid message = do
+  queue <- asks _sendQueue
+  liftIO . atomically . writeTQueue queue $ SendMessage cid message
+
+
+-- | Send a ping packet to the server
+-- The server will respond with a @pong@ `Event`.
+ping :: Slack ()
+ping = do
+  queue <- asks _sendQueue
+  liftIO . atomically $ writeTQueue queue SendPing
 
 
 ioUserError :: String -> LoggingT IO a
@@ -90,16 +144,16 @@ ioUserError s = do
   liftIO . ioError $ userError s
 
 
-rtmStart :: SlackConfig -> LoggingT IO (URLString, SlackSession)
-rtmStart conf = do
-  let token = conf ^. slackApiToken
+rtmStart :: Token -> LoggingT IO (URLString, SlackSession)
+rtmStart token = do
   r <- liftIO . get $ "https://slack.com/api/rtm.start?token=" ++ token
   case (r ^? responseBody) of
     Nothing -> ioUserError $ "No response body: " ++ show r
     Just resp -> do
       let Just (BoolPrim ok) = resp ^? key "ok" . _Primitive
       unless ok $
-        ioUserError $ "Unable to connect: " ++ (resp ^. key "error" . _String . unpacked)
+        ioUserError $ "Unable to connect: "
+                      ++ (resp ^. key "error" . _String . unpacked)
       let wsUrl = resp ^. key "url" . _String . unpacked
       case eitherDecode resp of
         Left e -> ioUserError e
@@ -127,9 +181,9 @@ setupSSL host = do
 --
 -- Be warned that this function will throw an `IOError` if the connection
 -- to the Slack API fails.
-runBot :: SlackConfig -> SlackBot -> LoggingT IO ()
-runBot conf bot = do
-  (wsUrl, session) <- rtmStart conf
+runBot :: Token -> SlackBot -> LoggingT IO ()
+runBot token bot = do
+  (wsUrl, session) <- rtmStart token
   loggerIO <- askLoggerIO
   queue <- liftIO newTQueueIO
   case parseWebSocketUrl wsUrl of
@@ -141,12 +195,12 @@ runBot conf bot = do
           WS.makeStream (StreamsIO.read sslIn)
                         (\b -> StreamsIO.write (B.toStrict <$> b) sslOut)
         WS.runClientWithStream stream host path WS.defaultConnectionOptions []
-          (\conn -> let botSession = SlackBotSession
+          (\conn -> let botSession = BotSession
                                      { _connection = conn
                                      , _slackSession = session
                                      , _logger = loggerIO
                                      , _sendQueue = queue
-                                     , _config = conf
+                                     , _apiToken = token
                                      }
                     in runBotSession botSession bot)
   where
@@ -157,7 +211,7 @@ runBot conf bot = do
       return (name, URI.uriPath uri)
 
 
-runBotSession :: SlackBotSession -> SlackBot -> IO ()
+runBotSession :: BotSession -> SlackBot -> IO ()
 runBotSession session bot = do
   liftIO $ WS.forkPingThread (session ^. connection) 10
   void . liftIO . forkIO $ runSlackBot session sender
@@ -210,5 +264,5 @@ receiver bot = void . forever $ do
     Right event -> go session event
  where
   err = logErrorNS "receiver"
-  go :: SlackBotSession -> Event -> Slack ()
+  go :: BotSession -> Event -> Slack ()
   go session event = void . liftIO . forkIO . runSlackBot session $ bot event
