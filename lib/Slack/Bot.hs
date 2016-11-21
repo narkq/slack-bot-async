@@ -221,7 +221,7 @@ runBotSession session bot = do
 
 pinger :: Slack ()
 pinger = void . forever $ do
-  liftIO $ threadDelay 1000000 -- 1 second
+  liftIO $ threadDelay 10000000 -- 10 seconds
   ping
 
 
