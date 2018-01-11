@@ -23,7 +23,6 @@ module Slack.Bot
 , Token
 , BotSession(..)
 , apiToken
-, slackSession
 , connection
 , sendQueue
 , logger
