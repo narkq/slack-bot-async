@@ -153,11 +153,8 @@ rtmStart token = do
         ioUserError $ "Unable to connect: "
                       ++ (resp ^. key "error" . _String . unpacked)
       let wsUrl = resp ^. key "url" . _String . unpacked
-      case eitherDecode resp of
-        Left e -> ioUserError e
-        Right session -> do
-          logInfoN "Connected"
-          return wsUrl
+      logInfoN "Connected"
+      return wsUrl
 
 
 -- | Setup an SSL connection. Must be run in SSL.withOpenSSL
