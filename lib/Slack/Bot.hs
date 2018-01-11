@@ -201,7 +201,7 @@ runBot token bot = do
     parseWebSocketUrl url = do
       uri  <- URI.parseURI url
       name <- URI.uriRegName <$> URI.uriAuthority uri
-      return (name, URI.uriPath uri)
+      return (name, URI.uriPath uri ++ URI.uriQuery uri)
 
 
 runBotSession :: BotSession -> SlackBot -> IO ()
