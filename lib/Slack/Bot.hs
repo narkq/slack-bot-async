@@ -146,7 +146,7 @@ ioUserError s = do
 
 rtmStart :: Token -> LoggingT IO (URLString, SlackSession)
 rtmStart token = do
-  r <- liftIO . get $ "https://slack.com/api/rtm.start?token=" ++ token
+  r <- liftIO . get $ "https://slack.com/api/rtm.connect?token=" ++ token
   case (r ^? responseBody) of
     Nothing -> ioUserError $ "No response body: " ++ show r
     Just resp -> do
