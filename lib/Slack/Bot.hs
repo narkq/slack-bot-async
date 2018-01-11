@@ -106,8 +106,6 @@ type SlackSendQueue = TQueue SendPayload
 data BotSession = BotSession
   { _sendQueue    :: SlackSendQueue
   , _apiToken     :: Token        -- ^ Slack API Token
-  , _slackSession :: SlackSession -- ^ Session information from the
-                                  -- start of the connection
   , _connection   :: WS.Connection
   , _logger       :: Loc -> LogSource -> LogLevel -> LogStr -> IO ()
   }
@@ -144,7 +142,7 @@ ioUserError s = do
   liftIO . ioError $ userError s
 
 
-rtmStart :: Token -> LoggingT IO (URLString, SlackSession)
+rtmStart :: Token -> LoggingT IO URLString
 rtmStart token = do
   r <- liftIO . get $ "https://slack.com/api/rtm.connect?token=" ++ token
   case (r ^? responseBody) of
@@ -159,7 +157,7 @@ rtmStart token = do
         Left e -> ioUserError e
         Right session -> do
           logInfoN "Connected"
-          return (wsUrl, session)
+          return wsUrl
 
 
 -- | Setup an SSL connection. Must be run in SSL.withOpenSSL
@@ -183,7 +181,7 @@ setupSSL host = do
 -- to the Slack API fails.
 runBot :: Token -> SlackBot -> LoggingT IO ()
 runBot token bot = do
-  (wsUrl, session) <- rtmStart token
+  wsUrl <- rtmStart token
   loggerIO <- askLoggerIO
   queue <- liftIO newTQueueIO
   case parseWebSocketUrl wsUrl of
@@ -197,7 +195,6 @@ runBot token bot = do
         WS.runClientWithStream stream host path WS.defaultConnectionOptions []
           (\conn -> let botSession = BotSession
                                      { _connection = conn
-                                     , _slackSession = session
                                      , _logger = loggerIO
                                      , _sendQueue = queue
                                      , _apiToken = token
